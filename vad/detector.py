@@ -1,8 +1,7 @@
-"""Voice-activity-detection stubs for the ``audio-vad`` bug-fix exercise.
+"""Voice-activity-detection implementation for the ``audio-vad`` bug-fix exercise.
 
-Every public function is intentionally unimplemented.  The docstrings define
-the contracts the tests rely on; each body raises :class:`NotImplementedError`
-so the initial suite is red but still importable and collectable.
+The public functions below implement the contracts stated in their own
+docstrings.
 
 Conventions used throughout this module
 --------------------------------------
@@ -24,6 +23,7 @@ Conventions used throughout this module
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping, Sequence
 
 __all__ = [
@@ -69,7 +69,26 @@ def frame_energy(
       non-finite sample also raises :class:`VadError`.
     """
 
-    raise NotImplementedError("frame_energy is not implemented")
+    if frame_len <= 0 or hop <= 0:
+        raise VadError("frame_len and hop must be positive integers")
+    for value in samples:
+        if not math.isfinite(value):
+            raise VadError("samples contain a non-finite value")
+
+    frame_count = 1 + (len(samples) - frame_len) // hop if len(samples) >= frame_len else 0
+    energies: list[float] = []
+    for index in range(frame_count):
+        start = index * hop
+        frame = samples[start : start + frame_len]
+        if all(value == 0.0 for value in frame):
+            energies.append(-240.0)
+            continue
+        sum_squares = 0.0
+        for value in frame:
+            sum_squares += value * value
+        rms = math.sqrt(sum_squares / frame_len)
+        energies.append(20.0 * math.log10(max(rms, 1e-12)))
+    return energies
 
 
 def zero_crossing_rate(
@@ -95,7 +114,22 @@ def zero_crossing_rate(
       0`` or ``hop <= 0`` raises :class:`VadError`.
     """
 
-    raise NotImplementedError("zero_crossing_rate is not implemented")
+    if frame_len <= 0 or hop <= 0:
+        raise VadError("frame_len and hop must be positive integers")
+
+    frame_count = 1 + (len(samples) - frame_len) // hop if len(samples) >= frame_len else 0
+    rates: list[float] = []
+    denominator = max(frame_len - 1, 1)
+    for index in range(frame_count):
+        start = index * hop
+        frame = samples[start : start + frame_len]
+        crossings = 0
+        for position in range(frame_len - 1):
+            if (frame[position] > 0) != (frame[position + 1] > 0):
+                crossings += 1
+        rate = crossings / denominator
+        rates.append(min(1.0, max(0.0, float(rate))))
+    return rates
 
 
 def spectral_flatness(frames: Sequence[Sequence[float]]) -> list[float]:
@@ -124,7 +158,59 @@ def spectral_flatness(frames: Sequence[Sequence[float]]) -> list[float]:
     returned.  A non-finite sample raises :class:`VadError`.
     """
 
-    raise NotImplementedError("spectral_flatness is not implemented")
+    flatness_values: list[float] = []
+    for frame in frames:
+        for value in frame:
+            if not math.isfinite(value):
+                raise VadError("frame contains a non-finite value")
+        if len(frame) < 2:
+            flatness_values.append(0.0)
+            continue
+
+        mean_x = sum(frame) / len(frame)
+        var_x = sum((value - mean_x) ** 2 for value in frame) / len(frame)
+
+        differences = [
+            frame[position + 1] - frame[position] for position in range(len(frame) - 1)
+        ]
+        mean_d = sum(differences) / len(differences)
+        var_d = sum((value - mean_d) ** 2 for value in differences) / len(differences)
+
+        flatness = var_d / (var_x + var_d + 1e-12)
+        flatness_values.append(min(1.0, max(0.0, float(flatness))))
+    return flatness_values
+
+
+def _validate_decide_params(params: Mapping[str, Any]) -> dict[str, float]:
+    """Validate the threshold mapping used by :func:`decide` and :func:`detect_batch`."""
+    required = (
+        "energy_on",
+        "energy_off",
+        "zcr_on",
+        "zcr_off",
+        "flatness_on",
+        "flatness_off",
+    )
+    try:
+        validated = {key: float(params[key]) for key in required}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise VadError(f"missing or invalid threshold parameter: {exc}") from exc
+
+    floor_value = params.get("energy_floor", -120.0)
+    try:
+        validated["energy_floor"] = float(floor_value)
+    except (TypeError, ValueError) as exc:
+        raise VadError("invalid energy_floor parameter") from exc
+
+    # Energy: the entry threshold is the higher (stricter) one.
+    if validated["energy_on"] < validated["energy_off"]:
+        raise VadError("energy_on must be greater than or equal to energy_off")
+    # ZCR and flatness: the entry threshold is the lower (stricter) one.
+    if validated["zcr_on"] > validated["zcr_off"]:
+        raise VadError("zcr_on must be less than or equal to zcr_off")
+    if validated["flatness_on"] > validated["flatness_off"]:
+        raise VadError("flatness_on must be less than or equal to flatness_off")
+    return validated
 
 
 def decide(
@@ -160,7 +246,38 @@ def decide(
     sequences and ``params`` are not modified.
     """
 
-    raise NotImplementedError("decide is not implemented")
+    if not (len(energy) == len(zcr) == len(flatness)):
+        raise VadError("energy, zcr, and flatness must have the same length")
+
+    thresholds = _validate_decide_params(params)
+    if not energy:
+        return []
+
+    floor = thresholds["energy_floor"]
+    mask: list[bool] = []
+    speaking = False
+    for frame in range(len(energy)):
+        # A frame at or below the energy floor is silence no matter what the
+        # other features say; this is what rejects all-zero frames.
+        if energy[frame] <= floor:
+            speaking = False
+            mask.append(False)
+            continue
+
+        if speaking:
+            speaking = (
+                energy[frame] >= thresholds["energy_off"]
+                and zcr[frame] <= thresholds["zcr_off"]
+                and flatness[frame] <= thresholds["flatness_off"]
+            )
+        else:
+            speaking = (
+                energy[frame] >= thresholds["energy_on"]
+                and zcr[frame] <= thresholds["zcr_on"]
+                and flatness[frame] <= thresholds["flatness_on"]
+            )
+        mask.append(speaking)
+    return mask
 
 
 def smooth(
@@ -186,7 +303,41 @@ def smooth(
     length; do not mutate ``mask``.
     """
 
-    raise NotImplementedError("smooth is not implemented")
+    if min_speech_frames < 1 or min_silence_frames < 0:
+        raise VadError("min_speech_frames must be >= 1 and min_silence_frames >= 0")
+
+    result = [bool(value) for value in mask]
+    if not result:
+        return result
+
+    # Encode the mask as (value, run_length) pairs for deterministic editing.
+    runs: list[list[bool | int]] = []
+    for value in result:
+        if runs and bool(runs[-1][0]) == value:
+            runs[-1][1] = int(runs[-1][1]) + 1
+        else:
+            runs.append([value, 1])
+
+    # Step 1: drop speech runs shorter than min_speech_frames.
+    for run in runs:
+        if bool(run[0]) and int(run[1]) < min_speech_frames:
+            run[0] = False
+
+    # Step 2: bridge internal silence runs shorter than min_silence_frames.
+    for index, run in enumerate(runs):
+        if (
+            not bool(run[0])
+            and int(run[1]) < min_silence_frames
+            and 0 < index < len(runs) - 1
+            and bool(runs[index - 1][0])
+            and bool(runs[index + 1][0])
+        ):
+            run[0] = True
+
+    smoothed: list[bool] = []
+    for value, length in runs:
+        smoothed.extend([bool(value)] * int(length))
+    return smoothed
 
 
 def segments(
@@ -215,7 +366,26 @@ def segments(
     allow a one-frame boundary tolerance.
     """
 
-    raise NotImplementedError("segments is not implemented")
+    if not isinstance(hop, int) or not isinstance(sample_rate, int):
+        raise VadError("hop and sample_rate must be integers")
+    if hop <= 0 or sample_rate <= 0:
+        raise VadError("hop and sample_rate must be positive")
+
+    intervals: list[tuple[int, int]] = []
+    frame_count = len(mask)
+    index = 0
+    while index < frame_count:
+        if not mask[index]:
+            index += 1
+            continue
+        start_frame = index
+        while index < frame_count and mask[index]:
+            index += 1
+        end_frame = index
+        # Pure integer multiplication: no floating-point accumulation, so
+        # boundaries never drift even on very long recordings.
+        intervals.append((start_frame * hop, end_frame * hop))
+    return intervals
 
 
 def hangover(
@@ -236,7 +406,22 @@ def hangover(
     :class:`VadError`.  The input mask is not modified.
     """
 
-    raise NotImplementedError("hangover is not implemented")
+    if frames < 0:
+        raise VadError("frames must be non-negative")
+
+    result = [False] * len(mask)
+    if frames == 0:
+        return [bool(value) for value in mask]
+
+    last_true = -1
+    for index, value in enumerate(mask):
+        if value:
+            last_true = index
+        # Hold speech only while this frame is within the capped window of
+        # the most recent true frame; beyond it silence stays silence.
+        if last_true >= 0 and index - last_true <= frames:
+            result[index] = True
+    return result
 
 
 def detect_batch(
@@ -266,4 +451,61 @@ def detect_batch(
     the output.  Inputs are never modified.
     """
 
-    raise NotImplementedError("detect_batch is not implemented")
+    # Validate parameters and every track before producing any output, so the
+    # whole batch is all-or-nothing and a bad track can never be skipped.
+    thresholds = _validate_decide_params(params)
+    for key in ("min_speech_frames", "min_silence_frames", "hangover_frames"):
+        try:
+            int(params[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VadError(f"missing or invalid batch parameter: {key}") from exc
+        if int(params[key]) < 0:
+            raise VadError(f"{key} must be non-negative")
+    if int(params["min_speech_frames"]) < 1:
+        raise VadError("min_speech_frames must be at least 1")
+
+    seen_ids: set[Any] = set()
+    for track in tracks:
+        for key in ("id", "samples", "frame_len", "hop", "sample_rate"):
+            if key not in track:
+                raise VadError(f"track is missing required key: {key}")
+        try:
+            hash(track["id"])
+        except TypeError as exc:
+            raise VadError("track id must be hashable") from exc
+        if track["id"] in seen_ids:
+            raise VadError(f"duplicate track id: {track['id']!r}")
+        seen_ids.add(track["id"])
+
+        if not isinstance(track["samples"], list) or not track["samples"]:
+            raise VadError("track samples must be a non-empty list")
+        for key in ("frame_len", "hop", "sample_rate"):
+            if not isinstance(track[key], int) or track[key] <= 0:
+                raise VadError(f"track {key} must be a positive integer")
+        if track["frame_len"] > len(track["samples"]):
+            raise VadError("frame_len must not exceed the number of samples")
+        for value in track["samples"]:
+            if not math.isfinite(value):
+                raise VadError("track samples contain a non-finite value")
+
+    min_speech = int(params["min_speech_frames"])
+    min_silence = int(params["min_silence_frames"])
+    hold_frames = int(params["hangover_frames"])
+
+    results: dict[Any, list[tuple[int, int]]] = {}
+    for track in tracks:
+        samples = track["samples"]
+        frame_len = track["frame_len"]
+        hop = track["hop"]
+
+        energies = frame_energy(samples, frame_len, hop)
+        rates = zero_crossing_rate(samples, frame_len, hop)
+        frame_slices = [
+            samples[index * hop : index * hop + frame_len] for index in range(len(energies))
+        ]
+        flatness = spectral_flatness(frame_slices)
+        mask = decide(energies, rates, flatness, thresholds)
+        mask = smooth(mask, min_speech, min_silence)
+        mask = hangover(mask, hold_frames)
+        results[track["id"]] = segments(mask, hop, track["sample_rate"])
+    return results
